@@ -7,8 +7,10 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"time"
 )
@@ -107,10 +109,67 @@ func (p *Provider) doRequest(request *http.Request) (response *http.Response, er
 		client = &http.Client{}
 	}
 
+	p.logRequest(request)
+
 	response, err = client.Do(request)
 	if err != nil {
 		return nil, fmt.Errorf("doRequest: failed to do request: %v", err)
 	}
 
+	p.logResponse(response)
+
 	return response, nil
+}
+
+func (p *Provider) logRequest(request *http.Request) {
+	if !debugHTTPEnabled() || request.Body == nil {
+		return
+	}
+
+	body, err := io.ReadAll(request.Body)
+	if err != nil {
+		log.Printf("wedos HTTP request: method=%s url=%s body_read_error=%v", request.Method, request.URL, err)
+		return
+	}
+	request.Body = io.NopCloser(strings.NewReader(string(body)))
+
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		log.Printf("wedos HTTP request: method=%s url=%s form_parse_error=%v", request.Method, request.URL, err)
+		return
+	}
+
+	var envelope requestEnvelope
+	if err := json.Unmarshal([]byte(form.Get("request")), &envelope); err != nil {
+		log.Printf("wedos HTTP request: method=%s url=%s request_parse_error=%v", request.Method, request.URL, err)
+		return
+	}
+
+	envelope.Request.Auth = "REDACTED"
+	redacted, err := json.Marshal(envelope)
+	if err != nil {
+		log.Printf("wedos HTTP request: method=%s url=%s redact_error=%v", request.Method, request.URL, err)
+		return
+	}
+
+	log.Printf("wedos HTTP request: method=%s url=%s body=%s", request.Method, request.URL, redacted)
+}
+
+func (p *Provider) logResponse(response *http.Response) {
+	if !debugHTTPEnabled() || response.Body == nil {
+		return
+	}
+
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		log.Printf("wedos HTTP response: status=%s body_read_error=%v", response.Status, err)
+		return
+	}
+	response.Body = io.NopCloser(strings.NewReader(string(body)))
+
+	log.Printf("wedos HTTP response: status=%s body=%s", response.Status, body)
+}
+
+func debugHTTPEnabled() bool {
+	return strings.EqualFold(os.Getenv("WEDOS_DEBUG_HTTP"), "true")
 }
