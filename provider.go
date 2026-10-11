@@ -4,6 +4,7 @@ package wedos
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 
@@ -13,6 +14,7 @@ import (
 const (
 	GetRecords    = "dns-rows-list"
 	AppendRecords = "dns-row-add"
+	CommitDomain  = "dns-domain-commit"
 	DeleteRecords = "dns-row-delete"
 	UpdateRecords = "dns-row-update"
 )
@@ -34,6 +36,30 @@ func NewProvider(username, password string) *Provider {
 		Password:   password,
 		httpClient: &http.Client{},
 	}
+}
+
+func (p *Provider) commitDomain(ctx context.Context, zone string) error {
+	request, err := p.buildRequest(ctx, CommitDomain, "CommitDomain", map[string]string{
+		"name": zone,
+	})
+	if err != nil {
+		return err
+	}
+
+	response, err := p.doRequest(request)
+	if err != nil {
+		return err
+	}
+
+	envelope, err := p.parseResponse(response, nil)
+	if err != nil {
+		return err
+	}
+	if envelope.Response.Code != OK {
+		return fmt.Errorf("commit domain: WEDOS returned code %d: %s", envelope.Response.Code, envelope.Response.Result)
+	}
+
+	return nil
 }
 
 // GetRecords lists all the records in the zone.
@@ -99,8 +125,14 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 			return nil, err
 		}
 
-		if envelope.Response.Code == 1000 {
+		if envelope.Response.Code == OK {
 			addedRecords = append(addedRecords, record)
+		}
+	}
+
+	if len(addedRecords) > 0 {
+		if err := p.commitDomain(ctx, normalizeZone(zone)); err != nil {
+			return addedRecords, err
 		}
 	}
 
@@ -111,6 +143,7 @@ func (p *Provider) AppendRecords(ctx context.Context, zone string, records []lib
 // It returns the updated records.
 func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	zone = normalizeZone(zone)
+	changed := false
 	payload := map[string]string{
 		"domain": zone,
 	}
@@ -171,8 +204,9 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 				return nil, err
 			}
 
-			if envelope.Response.Code == 1000 {
+			if envelope.Response.Code == OK {
 				updatedRecords = append(updatedRecords, recordToSet)
+				changed = true
 			} else {
 				// todo log error
 				continue
@@ -195,12 +229,21 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 				return nil, err
 			}
 
-			_, err = p.parseResponse(response, nil)
+			envelope, err := p.parseResponse(response, nil)
 			if err != nil {
-				return nil, err
+				return updatedRecords, err
+			}
+			if envelope.Response.Code != OK {
+				return updatedRecords, fmt.Errorf("update record: WEDOS returned code %d: %s", envelope.Response.Code, envelope.Response.Result)
 			}
 
 			updatedRecords = append(updatedRecords, recordToSet)
+			changed = true
+		}
+	}
+	if changed {
+		if err := p.commitDomain(ctx, zone); err != nil {
+			return updatedRecords, err
 		}
 	}
 
@@ -210,6 +253,7 @@ func (p *Provider) SetRecords(ctx context.Context, zone string, records []libdns
 // DeleteRecords deletes the specified records from the zone. It returns the records that were deleted.
 func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []libdns.Record) ([]libdns.Record, error) {
 	zone = normalizeZone(zone)
+	changed := false
 	payload := map[string]string{
 		"domain": zone,
 	}
@@ -275,13 +319,22 @@ func (p *Provider) DeleteRecords(ctx context.Context, zone string, records []lib
 			return nil, err
 		}
 
-		var env responseEnvelope
-		if _, err := p.parseResponse(resp, &env); err != nil {
-			return nil, err
+		env, err := p.parseResponse(resp, nil)
+		if err != nil {
+			return deletedRecords, err
+		}
+		if env.Response.Code != OK {
+			return deletedRecords, fmt.Errorf("delete record: WEDOS returned code %d: %s", env.Response.Code, env.Response.Result)
 		}
 
 		delete(wanted, key)
 		deletedRecords = append(deletedRecords, rec)
+		changed = true
+	}
+	if changed {
+		if err := p.commitDomain(ctx, zone); err != nil {
+			return deletedRecords, err
+		}
 	}
 
 	return deletedRecords, nil
